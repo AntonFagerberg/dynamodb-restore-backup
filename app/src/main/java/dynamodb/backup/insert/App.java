@@ -5,6 +5,7 @@ import java.io.FileInputStream;
 import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -18,10 +19,11 @@ import com.amazonaws.auth.BasicAWSCredentials;
 import com.amazonaws.client.builder.AwsClientBuilder;
 import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
 import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClientBuilder;
+import com.amazonaws.services.dynamodbv2.document.DynamoDB;
+import com.amazonaws.services.dynamodbv2.document.Item;
+import com.amazonaws.services.dynamodbv2.document.ItemUtils;
+import com.amazonaws.services.dynamodbv2.document.TableWriteItems;
 import com.amazonaws.services.dynamodbv2.model.AttributeValue;
-import com.amazonaws.services.dynamodbv2.model.Put;
-import com.amazonaws.services.dynamodbv2.model.TransactWriteItem;
-import com.amazonaws.services.dynamodbv2.model.TransactWriteItemsRequest;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.MapperFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -34,50 +36,58 @@ public class App {
     public void run(Path file, String tableName, AmazonDynamoDB client) throws Exception {
         System.out.println(file.getFileName() + " start");
 
+        final var dynamoDB = new DynamoDB(client);
         final var objectMapper = new ObjectMapper().configure(MapperFeature.ACCEPT_CASE_INSENSITIVE_PROPERTIES, true);
         final var start = System.currentTimeMillis();
 
         var totalInFile = 0L;
 
         try (FileInputStream fis = new FileInputStream(file.toString());
-                GZIPInputStream gzis = new GZIPInputStream(fis);
-                InputStreamReader reader = new InputStreamReader(gzis);
-                BufferedReader in = new BufferedReader(reader)) {
+             GZIPInputStream gzis = new GZIPInputStream(fis);
+             InputStreamReader reader = new InputStreamReader(gzis);
+             BufferedReader in = new BufferedReader(reader)) {
 
             String line;
-            var count = 0L;
-            var transactWriteItemsRequest = new TransactWriteItemsRequest();
+            final var maxBatchItems = 25;
+            var items = new HashSet<Item>(maxBatchItems);
 
             while ((line = in.readLine()) != null) {
-                if (count == 0) {
-                    transactWriteItemsRequest = new TransactWriteItemsRequest();
+                if (items.size() == maxBatchItems) {
+                    var outcome = dynamoDB.batchWriteItem(new TableWriteItems(tableName).withItemsToPut(items));
+
+                    do {
+                        if (outcome.getUnprocessedItems().size() != 0) {
+                            outcome = dynamoDB.batchWriteItemUnprocessed(outcome.getUnprocessedItems());
+                        }
+                    } while (outcome.getUnprocessedItems().size() > 0);
+
+                    var currentGrandTotal = grandTotal.addAndGet(items.size());
+
+                    if (currentGrandTotal % 100 == 0) {
+                        System.out.println("Done " + currentGrandTotal + " items [" + elapsed(allStart) + "]");
+                    }
+                    totalInFile += items.size();
+                    items.clear();
                 }
 
                 final var item = objectMapper.readTree(line).get("Item");
                 final Map<String, AttributeValue> itemMap = objectMapper.convertValue(item, new TypeReference<>() {
 
                 });
-                final var transactWriteItem = new TransactWriteItem().withPut(
-                        new Put().withItem(itemMap).withTableName(tableName));
 
-                transactWriteItemsRequest.withTransactItems(transactWriteItem);
-                count++;
-
-                if (count == 100) {
-                    client.transactWriteItems(transactWriteItemsRequest);
-                    var currentGrandTotal = grandTotal.addAndGet(count);
-                    if (currentGrandTotal % 100 == 0) {
-                        System.out.println("Done " + currentGrandTotal + " items [" + elapsed(allStart) + "]");
-                    }
-                    totalInFile += count;
-                    count = 0;
-                }
+                items.add(ItemUtils.toItem(itemMap));
             }
 
-            if (count != 0) {
-                client.transactWriteItems(transactWriteItemsRequest);
-                totalInFile += count;
-                grandTotal.addAndGet(count);
+            if (items.size() > 0) {
+                var outcome = dynamoDB.batchWriteItem(new TableWriteItems(tableName).withItemsToPut(items));
+
+                do {
+                    if (outcome.getUnprocessedItems().size() != 0) {
+                        outcome = dynamoDB.batchWriteItemUnprocessed(outcome.getUnprocessedItems());
+                    }
+                } while (outcome.getUnprocessedItems().size() > 0);
+
+                totalInFile += items.size();
             }
         }
 
@@ -102,7 +112,7 @@ public class App {
                 .build();
 
         final var files = Files.list(Path.of(sourceFolder)).collect(Collectors.toList());
-// Uncomment to get some parallelizations - but it don't make DynamoDB Local import any faster
+// Uncomment to get some parallelization - but it doesn't make DynamoDB Local import any faster
 //        final var availableProcessors = Runtime.getRuntime().availableProcessors();
 //        System.out.println("Found " + availableProcessors + " available processors");
 //        ExecutorService executor = Executors.newFixedThreadPool(availableProcessors);
